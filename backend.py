@@ -44,7 +44,7 @@ GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 if not GROQ_API_KEY:
     raise ValueError("GROQ_API_KEY is not set in the environment variables.")
 
-llm = ChatGroq(model="llama-3.3-70b-versatile", api_key=GROQ_API_KEY)
+llm = ChatGroq(model="llama-3.1-8b-instant", api_key=GROQ_API_KEY)
 
 
 # =========================
@@ -144,7 +144,59 @@ def _format_hotels_for_prompt(hotels: list) -> str:
         lines.append(f"{city_tag}{h['title']}{price_tag} — {h['snippet']} ({h['url']})")
     return "\n".join(lines)
 
-
+from datetime import datetime
+ 
+ 
+def _extract_trip_days(user_query: str, flight_offers: list | None = None) -> int:
+    """
+    Figures out how many days the trip should span, in priority order:
+    1. An explicit "N day(s)" / "N-day" mention in the user's query.
+    2. The gap between the earliest and latest flight-leg departure dates,
+       if flight_offers has enough data (covers cases where the query
+       doesn't state a duration but does give travel dates).
+    3. A conservative default of 7.
+    """
+    match = re.search(r"\b(\d{1,2})\s*[- ]?days?\b", user_query, re.IGNORECASE)
+    if match:
+        days = int(match.group(1))
+        if 1 <= days <= 60:
+            return days
+ 
+    if flight_offers:
+        try:
+            dep_dates = sorted(
+                {
+                    o["segments"][0]["dep_time"][:10]
+                    for o in flight_offers
+                    if o.get("segments") and o["segments"][0].get("dep_time")
+                }
+            )
+            if len(dep_dates) >= 2:
+                span = (
+                    datetime.strptime(dep_dates[-1], "%Y-%m-%d")
+                    - datetime.strptime(dep_dates[0], "%Y-%m-%d")
+                ).days
+                if 1 <= span <= 60:
+                    return span
+        except (KeyError, ValueError, IndexError, TypeError):
+            pass
+ 
+    return 7  # conservative fallback — matches the most common query pattern
+ 
+ 
+def _trim_itinerary_to_days(itinerary_text: str, trip_days: int) -> str:
+    """
+    Safety net: even with the constrained prompt below, keep only the
+    first `trip_days` "### Day N" blocks so an over-generating model can
+    never surface a longer trip than the user asked for.
+    """
+    blocks = re.split(r"(?=### Day \d+:)", itinerary_text)
+    day_blocks = [b for b in blocks if b.strip().startswith("### Day")]
+    if len(day_blocks) <= trip_days:
+        return itinerary_text
+ 
+    preamble = blocks[0] if blocks and not blocks[0].strip().startswith("### Day") else ""
+    return preamble + "".join(day_blocks[:trip_days])
 
 
 # =========================
@@ -153,40 +205,55 @@ def _format_hotels_for_prompt(hotels: list) -> str:
 def itinerary_agent(state: TravelState):
     flight_text = _format_offers_for_prompt(state["flight_offers"])
     hotel_text = _format_hotels_for_prompt(state["hotel_results"])
-
+ 
+    trip_days = _extract_trip_days(state["user_query"], state.get("flight_offers"))
+ 
     prompt = f"""
 Create a complete, detailed DAY-BY-DAY travel itinerary for this trip.
-
+ 
 User Query: {state['user_query']}
-
+ 
+This trip is EXACTLY {trip_days} days long — from the day the traveler departs
+their home city to the day they arrive back. Produce EXACTLY {trip_days} day
+entries, Day 1 through Day {trip_days}, and nothing more. Once the traveler
+returns home, the itinerary ends immediately — do NOT add extra days exploring
+the home city after the return flight.
+ 
 Flight Offers:
 {flight_text}
-
+ 
 Hotel Options:
 {hotel_text}
-
+ 
 STRICT FORMAT REQUIREMENTS:
-- Cover EVERY single day of the trip individually. Do NOT group days together
-  (e.g. never write "Day 2-6" or "Day 1-7" — write Day 1, Day 2, Day 3, ... separately,
-  even if the destination city doesn't change).
+- Cover every day from Day 1 to Day {trip_days} individually. Do NOT group days
+  together (e.g. never write "Day 2-6" or "Day 1-7" — write Day 1, Day 2, Day 3,
+  ... separately, even if the destination city doesn't change).
+- Do NOT produce more than {trip_days} day entries under any circumstances.
 - Each day MUST use this exact header format: "### Day N: <date> - <short theme>"
 - Each day must list AT LEAST 3 specific, named activities or attractions
   (real landmark/museum/neighborhood names for the actual destination city —
   not generic filler like "explore the city" or "enjoy local cuisine").
 - Include a rough time-of-day structure per day (Morning / Afternoon / Evening)
   where it makes sense.
-- On travel days, include the flight details AND at least one activity
-  once the traveler has settled in (unless arrival is very late).
+- On travel days, include the flight details AND at least one activity once
+  the traveler has settled in (unless arrival is very late).
 - Make it practical and budget-aware, using the flight and hotel data above.
 """
-
+ 
     response = llm.invoke([
-        SystemMessage(content="You are an expert travel assistant who writes thorough, non-repetitive, day-by-day itineraries. You never merge multiple days into one entry."),
+        SystemMessage(content=(
+            "You are an expert travel assistant who writes thorough, non-repetitive, "
+            "day-by-day itineraries. You never merge multiple days into one entry, and "
+            "you never exceed the exact trip length you are given."
+        )),
         HumanMessage(content=prompt)
     ])
-
+ 
+    itinerary_text = _trim_itinerary_to_days(response.content, trip_days)
+ 
     return {
-        "itinerary": response.content,
+        "itinerary": itinerary_text,
         "messages": [response],
         "llm_calls": state.get("llm_calls", 0) + 1,
     }
